@@ -1,0 +1,11 @@
+## Interface: 11200
+## Title: Mooncaller
+## Notes: Druid HoT healing with Banzai aggro integration, pressure-based rank selection, AoE blanket mode, and healing power scanning.
+## Author: Rel
+## Version: 0.1
+## SavedVariables: MooncallerDB
+libs\AceLibrary\AceLibrary.lua
+libs\AceEvent-2.0\AceEvent-2.0.lua
+libs\RosterLib-2.0\RosterLib-2.0.lua
+libs\Banzai-1.0\Banzai-1.0.lua
+Mooncaller.lua
