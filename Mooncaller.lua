@@ -13,8 +13,7 @@ Client: TurtleWoW 1.12 / SuperWoW -- Lua 5.0 compatible, no goto statements
 
 MooncallerDB = MooncallerDB or {
     DEBUG_MODE            = false,
-    REJUV_THRESHOLD       = 90,   -- Firehose/trickle Rejuv spread threshold
-    SWIFTMEND_THRESHOLD   = 60,   -- Base Swiftmend threshold % (scales up for aggro holders)
+    REJUV_THRESHOLD       = 90,   -- Firehose/trickle Rejuv spread threshold; also gates Swiftmend
     TRICKLE_THRESHOLD     = 98,   -- Top-up Rejuv for anyone below this % (cheap low ranks)
     TRICKLE_MAX_RANK      = 3,    -- Max Rejuv rank used during trickle pass
     TRICKLE_MANA_FLOOR    = 40,   -- Skip trickle if mana below this %
@@ -27,6 +26,13 @@ MooncallerDB = MooncallerDB or {
     AOE_BLANKET_THRESHOLD       = 3,    -- uncovered players needed to trigger firehose-priority mode
     REGROWTH_NON_TANK_FLOOR     = 0.55, -- min pressure for Regrowth on non-tank units
     CRITICAL_THRESHOLD          = 70,   -- HP% below which active healing mode activates
+    QUICKHEAL_AVOID             = false, -- skip lowest-HP target for Regrowth (yields to QuickHeal)
+    SWIFTMEND_EXPIRY_WINDOW     = 3.5,  -- seconds remaining on Rejuv before expiry-path Swiftmend fires
+    TANK_LIST                   = {},   -- saved tank names keyed by name for O(1) lookup
+    OVERHEAL_TANKS              = false, -- always keep max Rejuv+Regrowth on listed tanks with live aggro
+    SWIFTMEND_ENABLED           = true,  -- master enable for Swiftmend
+    DISABLED_REJUV_RANKS        = {},    -- ranks to skip, keyed by rank number = true
+    DISABLED_REGROWTH_RANKS     = {},    -- ranks to skip, keyed by rank number = true
 }
 
 -------------------------------------------------------------------------------
@@ -51,6 +57,15 @@ local aggroCount      = {}
 
 -- liveAggro[unitName] = true/false, set directly from Banzai events
 local liveAggro       = {}
+
+-- tankList[unitName] = true — manually configured priority tanks
+-- Mirrors MooncallerDB.TANK_LIST; populated on ADDON_LOADED.
+local tankList        = {}
+
+-- Spell rank disable tables — keyed by rank number, value = true means skip that rank.
+-- Mirrors MooncallerDB.DISABLED_REJUV_RANKS / DISABLED_REGROWTH_RANKS.
+local disabledRejuvRanks    = {}
+local disabledRegrowthRanks = {}
 
 -------------------------------------------------------------------------------
 -- Heal Decision Log
@@ -296,6 +311,30 @@ local function HasAnyHotForSwiftmend(unit)
     return HasRejuvenation(unit) or HasRegrowth(unit)
 end
 
+-- Returns the expiration time (abs server time from GetTime()) of the Rejuvenation
+-- buff on the given unit, or nil if not present.
+-- Requires SuperWoW — UnitBuff returns expirationTime as 5th value.
+local function GetRejuvExpiryTime(unit)
+    local ids = SPELL_ID_LOOKUP["Rejuvenation"]
+    for i = 1, 32 do
+        local _, _, buffId, _, expirationTime = UnitBuff(unit, i)
+        if not buffId then break end
+        for _, id in ipairs(ids) do
+            if buffId == id then
+                return expirationTime  -- may be 0 if duration unknown, caller handles
+            end
+        end
+    end
+    return nil
+end
+
+-- Returns true if Swiftmend is currently on cooldown.
+local function IsSwiftmendOnCooldown()
+    local start, duration = GetSpellCooldown("Swiftmend")
+    if not start or start == 0 then return false end
+    return (start + duration) > GetTime()
+end
+
 local function DetectClearcasting()
     -- Omen of Clarity clearcasting proc: texture "Spell_Shadow_ManaBurn"
     -- UnitBuff returns texture as first return value in 1.12
@@ -322,8 +361,9 @@ local function IsUnitInRange(unit, spellName)
     if unit == "player" then return true end
     if not UnitPosition then return true end  -- SuperWoW unavailable, assume in range
     local px, py = UnitPosition("player")
+    if not px then return true end  -- can't get own position, fail open
     local ux, uy = UnitPosition(unit)
-    if not px or not ux then return true end  -- position unavailable, assume in range
+    if not ux then return false end  -- unit position unknown = out of range
     local dx = px - ux
     local dy = py - uy
     return math.sqrt(dx*dx + dy*dy) <= REJUV_RANGE
@@ -369,7 +409,34 @@ aggroDecayFrame:SetScript("OnUpdate", function()
 end)
 
 -------------------------------------------------------------------------------
--- Healing Power Scanner
+-- Movement Detection
+-- Polls UnitPosition("player") every 0.1s. Sets isMoving = true when position
+-- changes between samples, clears it when stable. Regrowth (cast-time spell)
+-- is suppressed while moving; Rejuv and Swiftmend (instants) fire normally.
+-------------------------------------------------------------------------------
+
+local isMoving        = false
+local moveLastX       = nil
+local moveLastY       = nil
+local moveElapsed     = 0
+local MOVE_POLL_RATE  = 0.1
+
+local movePollFrame = CreateFrame("Frame")
+movePollFrame:SetScript("OnUpdate", function()
+    moveElapsed = moveElapsed + arg1
+    if moveElapsed < MOVE_POLL_RATE then return end
+    moveElapsed = 0
+    if not UnitPosition then return end  -- SuperWoW unavailable
+    local x, y = UnitPosition("player")
+    if not x then return end
+    if moveLastX and (x ~= moveLastX or y ~= moveLastY) then
+        isMoving = true
+    else
+        isMoving = false
+    end
+    moveLastX = x
+    moveLastY = y
+end)
 -- Tooltip-scans all 19 equipment slots, weapon oils, and active buffs.
 -- Buckets +damage and healing separately from +healing only.
 -- Cache invalidates on inventory or aura change.
@@ -594,6 +661,14 @@ local function CastRejuvByRank(rank)
     local ids = SPELL_ID_LOOKUP["Rejuvenation"]
     local maxRank = table.getn(ids)
     rank = math.max(1, math.min(rank, maxRank))
+    -- Step down to nearest enabled rank
+    while rank > 1 and disabledRejuvRanks[rank] do
+        rank = rank - 1
+    end
+    if disabledRejuvRanks[rank] then
+        Debug("CastRejuvByRank: all ranks disabled, skipping")
+        return
+    end
     local rankStr = rank == maxRank and "Rejuvenation" or ("Rejuvenation(Rank " .. rank .. ")")
     CastSpellByName(rankStr)
     Debug("Casting " .. rankStr)
@@ -697,6 +772,14 @@ local function CastRegrowthSafe(unit, intendedRank, pressure)
     end
 
     castRank = math.max(1, math.min(castRank, maxRgRank))
+    -- Step down to nearest enabled rank
+    while castRank > 1 and disabledRegrowthRanks[castRank] do
+        castRank = castRank - 1
+    end
+    if disabledRegrowthRanks[castRank] then
+        Debug("CastRegrowthSafe: all ranks disabled, skipping")
+        return false
+    end
     local rankStr = castRank == maxRgRank
         and "Regrowth"
         or  ("Regrowth(Rank " .. castRank .. ")")
@@ -777,6 +860,12 @@ local function ComputeTankPressureScore(unit)
     -- Historical aggro bonus: sustained tank, scaled 0..0.25
     pressure = pressure + math.min(score, 30) / 30 * 0.25
 
+    -- Listed tank bonus: manually designated tanks get an additional flat boost
+    -- so they always score above aggro-detected units at equivalent HP.
+    if tankList[name] then
+        pressure = pressure + 0.30
+    end
+
     -- HoT coverage reduction: existing ticks lower urgency
     local maxRejuvRank  = table.getn(SPELL_ID_LOOKUP["Rejuvenation"])
     local maxRegrowthRank = table.getn(SPELL_ID_LOOKUP["Regrowth"])
@@ -817,9 +906,15 @@ end
 -- (has live aggro or a meaningful aggro history score)
 local TANK_SCORE_FLOOR = 5  -- minimum aggroCount to be treated as a tank
 
+local function IsListedTank(unit)
+    local name = UnitName(unit)
+    if not name then return false end
+    return tankList[name] == true
+end
+
 local function IsTankLike(unit)
     local name = UnitName(unit)
-    return liveAggro[name] or (aggroCount[name] or 0) >= TANK_SCORE_FLOOR
+    return tankList[name] or liveAggro[name] or (aggroCount[name] or 0) >= TANK_SCORE_FLOOR
 end
 
 -- Pick the appropriate Regrowth rank for a unit based on pressure score.
@@ -878,6 +973,9 @@ local function EffectiveHealthScore(unit)
     local hp = (UnitHealth(unit) / UnitHealthMax(unit)) * 100
     local name = UnitName(unit)
     local aggroBias = 0
+    if tankList[name] then
+        aggroBias = aggroBias + 20  -- listed tanks always sort above aggro-detected units
+    end
     if liveAggro[name] then
         aggroBias = aggroBias + 10
     end
@@ -888,16 +986,6 @@ end
 
 local function SortByEffectiveHealth(a, b)
     return EffectiveHealthScore(a) < EffectiveHealthScore(b)
-end
-
--------------------------------------------------------------------------------
--- Swiftmend Threshold
--- Flat threshold — tank-like units are excluded from Swiftmend entirely
--- so aggro scaling here is no longer needed.
--------------------------------------------------------------------------------
-
-local function SwiftmendThresholdFor(unit)
-    return settings.SWIFTMEND_THRESHOLD
 end
 
 -------------------------------------------------------------------------------
@@ -1107,6 +1195,91 @@ local function HealPartyMembers()
 
     ManageTreeForm()
 
+    -- ---- Overheal Tanks pass ----
+    -- When OVERHEAL_TANKS is ON: any listed tank with live aggro that is missing
+    -- max rank Rejuv or max rank Regrowth gets it cast immediately, before any
+    -- other logic runs. Rejuv takes priority over Regrowth (cast Rejuv first
+    -- keypress, Regrowth next). Iterates all qualifying tanks per keypress and
+    -- fires on the first in-range gap found.
+    if settings.OVERHEAL_TANKS then
+        local maxRejuvRank = table.getn(SPELL_ID_LOOKUP["Rejuvenation"])
+        local maxRgRank    = table.getn(SPELL_ID_LOOKUP["Regrowth"])
+        local overhealDone = false
+        IterateHealableUnits(function(unit)
+            if overhealDone then return end
+            if not UnitExists(unit) then return end
+            if UnitIsDeadOrGhost(unit) then return end
+            if not IsListedTank(unit) then return end
+            local name = UnitName(unit)
+            if not liveAggro[name] then return end
+            if not IsUnitInRange(unit, "Rejuvenation") then return end
+            -- Rejuv gap: missing or below max rank
+            if GetRejuvRank(unit) < maxRejuvRank then
+                TargetUnit(unit)
+                CastRejuvByRank(maxRejuvRank)
+                TargetLastTarget()
+                LogHealAction(unit, 1.0, "OVERHEAL_REJUV", maxRejuvRank)
+                Debug("OVERHEAL: max Rejuv R" .. maxRejuvRank .. " on " .. name)
+                overhealDone = true
+            -- Regrowth gap: missing or below max rank (skipped while moving)
+            elseif not isMoving
+            and IsUnitInRange(unit, "Regrowth")
+            and GetRegrowthRank(unit) < maxRgRank then
+                TargetUnit(unit)
+                CastRegrowthSafe(unit, maxRgRank, 1.0)
+                TargetLastTarget()
+                LogHealAction(unit, 1.0, "OVERHEAL_REGROWTH", maxRgRank)
+                Debug("OVERHEAL: max Regrowth R" .. maxRgRank .. " on " .. name)
+                overhealDone = true
+            end
+        end)
+        if overhealDone then
+            healBusy = false
+            return
+        end
+    end
+
+    -- ---- Expiry-path Swiftmend ----
+    -- Fires on every keypress (trickle, firehose, or active mode) regardless of
+    -- HP%.  Scans all members for a Rejuv within SWIFTMEND_EXPIRY_WINDOW seconds
+    -- of expiring, then Swiftmends the soonest-expiring candidate to capture the
+    -- heal before the remaining ticks are lost and keep Swiftmend on CD.
+    -- Tanks excluded (Swiftmend consumes the HoT). Skipped if window == 0 or CD.
+    local expiryWindow = settings.SWIFTMEND_EXPIRY_WINDOW or 3.5
+    if (settings.SWIFTMEND_ENABLED ~= false) and expiryWindow > 0 and not IsSwiftmendOnCooldown() then
+        local now        = GetTime()
+        local bestUnit   = nil
+        local bestExpiry = math.huge  -- pick the soonest-expiring Rejuv
+        IterateHealableUnits(function(unit)
+            if not UnitExists(unit) then return end
+            if UnitIsDeadOrGhost(unit) then return end
+            if not UnitIsConnected(unit) then return end
+            if IsTankLike(unit) then return end
+            if not IsUnitInRange(unit, "Swiftmend") then return end
+            local expiry = GetRejuvExpiryTime(unit)
+            if expiry and expiry > 0 then
+                local remaining = expiry - now
+                if remaining > 0 and remaining <= expiryWindow then
+                    if remaining < bestExpiry then
+                        bestExpiry = remaining
+                        bestUnit   = unit
+                    end
+                end
+            end
+        end)
+        if bestUnit then
+            local name     = UnitName(bestUnit)
+            local pressure = ComputeTankPressureScore(bestUnit)
+            TargetUnit(bestUnit)
+            CastSpellByName("Swiftmend")
+            TargetLastTarget()
+            LogHealAction(bestUnit, pressure, "SWIFTMEND_EXPIRY", 1)
+            Debug(string.format("SWIFTMEND_EXPIRY on %s (%.1fs remaining)", name, bestExpiry))
+            healBusy = false
+            return
+        end
+    end
+
     -- ---- Build member lists ----
     local allMembers = {}   -- {unit, health}  all valid in-range members
     local lowMembers = {}   -- units below REJUV_THRESHOLD (for normal pass)
@@ -1208,6 +1381,35 @@ local function HealPartyMembers()
             end
         end
 
+        -- ---- SWIFTMEND PASS ----
+        -- Fire Swiftmend on the lowest-health non-tank who is below REJUV_THRESHOLD
+        -- and already has a HoT ticking. Runs here so Swiftmend is treated as a
+        -- HoT-efficiency tool rather than an emergency heal. Tanks excluded.
+        if (settings.SWIFTMEND_ENABLED ~= false) and not IsSwiftmendOnCooldown() then
+            local smCandidates = {}
+            for _, m in ipairs(allMembers) do
+                if m.health < settings.REJUV_THRESHOLD
+                and not IsTankLike(m.unit)
+                and HasAnyHotForSwiftmend(m.unit)
+                and IsUnitInRange(m.unit, "Swiftmend") then
+                    table.insert(smCandidates, m.unit)
+                end
+            end
+            if table.getn(smCandidates) > 0 then
+                table.sort(smCandidates, SortByEffectiveHealth)
+                local target   = smCandidates[1]
+                local pressure = ComputeTankPressureScore(target)
+                TargetUnit(target)
+                CastSpellByName("Swiftmend")
+                TargetLastTarget()
+                Debug("SWIFTMEND on " .. UnitName(target) ..
+                      string.format(" hp=%.0f%%", (UnitHealth(target)/UnitHealthMax(target))*100))
+                LogHealAction(target, pressure, "SWIFTMEND", 1)
+                healBusy = false
+                return
+            end
+        end
+
         -- Nothing to do
         Debug("TRICKLE/FIREHOSE: all covered")
         healBusy = false
@@ -1226,14 +1428,12 @@ local function HealPartyMembers()
     -- ACTIVE HEALING (someone is below CRITICAL_THRESHOLD)
     --
     -- Decision tree per keypress:
-    --   0. NS crisis — any unit at pressure >= 0.90 → NS + instant Regrowth
     --   1. AoE blanket check — if uncovered players >= AOE_BLANKET_THRESHOLD,
     --      firehose Rejuv on highest-pressure uncovered unit.
     --      Exception: tanks always get Regrowth regardless of blanket mode.
     --   2. Single-target active — for highest-pressure candidate:
-    --      a. Swiftmend (non-tank, below threshold, has HoT)
-    --      b. Regrowth — tanks always; non-tanks only if pressure >= REGROWTH_NON_TANK_FLOOR
-    --      c. Rejuv — fresh cast or upgrade
+    --      a. Regrowth — tanks always; non-tanks only if pressure >= REGROWTH_NON_TANK_FLOOR
+    --      b. Rejuv — fresh cast or upgrade
     -- =========================================================
     Debug("ACTIVE HEALING MODE")
     local healingDone = false
@@ -1274,7 +1474,7 @@ local function HealPartyMembers()
             local topUnit  = topEntry.unit
             local topPres  = topEntry.pressure
             if IsTankLike(topUnit) and GetRegrowthRank(topUnit) == 0
-            and IsUnitInRange(topUnit, "Regrowth") then
+            and not isMoving and IsUnitInRange(topUnit, "Regrowth") then
                 local rgRank = PickRegrowthRank(topPres)
                 if rgRank > 0 then
                     TargetUnit(topUnit)
@@ -1308,6 +1508,15 @@ local function HealPartyMembers()
     end
 
     -- ---- Step 2: Single-target active healing ----
+    -- QuickHeal avoidance: when ON, skip Regrowth on the lowest-pressure candidate
+    -- so QuickHeal's direct heal lands there. Rejuv is unaffected.
+    -- Waived when there is only one candidate.
+    local qhAvoidUnit = nil
+    if settings.QUICKHEAL_AVOID and table.getn(pressureCandidates) > 1 then
+        qhAvoidUnit = pressureCandidates[table.getn(pressureCandidates)].unit
+        Debug("QuickHeal avoid: deferring Regrowth on " .. (UnitName(qhAvoidUnit) or "?"))
+    end
+
     for _, entry in ipairs(pressureCandidates) do
         local unit     = entry.unit
         local pressure = entry.pressure
@@ -1321,28 +1530,17 @@ local function HealPartyMembers()
             Debug(string.format("HEAL: %s hp=%.0f%% pressure=%.2f tank=%s",
                   name, hp, pressure, tostring(isTank)))
 
-            -- Swiftmend: non-tank only, non-blocking
-            if not isTank then
-                local smThresh = SwiftmendThresholdFor(unit)
-                if hp < smThresh and HasAnyHotForSwiftmend(unit)
-                and IsUnitInRange(unit, "Swiftmend") then
-                    TargetUnit(unit)
-                    CastSpellByName("Swiftmend")
-                    TargetLastTarget()
-                    Debug("SWIFTMEND on " .. name ..
-                          string.format(" (thresh=%.0f pressure=%.2f)", smThresh, pressure))
-                    LogHealAction(unit, pressure, "SWIFTMEND", 1)
-                    -- fall through to also cast Regrowth or Rejuv
-                end
-            end
-
             -- Regrowth: tanks always; non-tanks only above REGROWTH_NON_TANK_FLOOR
+            -- QuickHeal avoidance: skip Regrowth on lowest-pressure unit so their
+            -- direct heal lands there. Rejuv still fires on them normally.
             local currentRejuvRank = GetRejuvRank(unit)
             local wantsRegrowth    = isTank or pressure >= rgFloor
             -- Skip Regrowth if no Rejuv yet and not urgent — lay Rejuv first
             local skipForRejuv     = (currentRejuvRank == 0 and not isTank and pressure < 0.70)
+            local skipForQH        = (qhAvoidUnit == unit)
+            local skipMoving       = isMoving  -- Regrowth has a cast time, suppress while moving
 
-            if wantsRegrowth and not skipForRejuv
+            if wantsRegrowth and not skipForRejuv and not skipForQH and not skipMoving
             and IsUnitInRange(unit, "Regrowth") then
                 local rgRank = PickRegrowthRank(pressure)
                 if rgRank > 0 then
@@ -1498,8 +1696,14 @@ local function PrintUsage()
     Print("  /mcfollow            - Toggle follow")
     Print("  /mcl                 - Set follow target to current target")
     Print("  /mcstatus            - Show healing power and Rejuv effective heals per rank")
-    Print("  /mcdr                - Healing style GUI (Regrowth floor, AoE blanket threshold)")
-    Print("  /mcsettings          - Threshold config GUI (Rejuv, Swiftmend, Trickle, MoTW)")
+    Print("  /mcdr                - Spell rank GUI (enable/disable individual Rejuv, Regrowth, Swiftmend)")
+    Print("  /mcsettings          - Settings GUI (thresholds, Overheal Tanks, QuickHeal Avoidance)")
+    Print("  /mctanks             - Priority tank list GUI")
+    Print("  /mcaddtank [name]    - Add player to priority tank list (defaults to target)")
+    Print("  /mcremovetank [name] - Remove player from priority tank list")
+    Print("  /mccleartanks        - Clear the entire tank list")
+    Print("  /mclisttanks         - Print current tank list")
+    Print("  /mcqh                - Toggle QuickHeal avoidance")
     Print("  /mclog               - Toggle heal decision logging on/off")
     Print("  /mcexport            - Write log buffer to MooncallerLog.txt")
     Print("  /mclogclear          - Clear log buffer without writing")
@@ -1511,25 +1715,17 @@ local function PrintUsage()
     Print("  /mc                  - Show this help")
 end
 
--------------------------------------------------------------------------------
--- GUI Windows
--- /mcdr       — Healing Style (per-fight tuning)
--- /mcsettings — Thresholds (set-once config)
--------------------------------------------------------------------------------
-
-local mcDrFrame       = nil
-local mcSettingsFrame = nil
-
 local MC_SLIDER_TOOLTIPS = {
     RgFloor      = { "Min pressure for non-tank units to receive Regrowth.", "Tanks always get Regrowth. Raise to be more selective." },
     AoeBlanket   = { "How many uncovered players trigger firehose mode.", "In firehose mode, Rejuvs are prioritised over Regrowth." },
     RejuvThresh  = { "HP% below which firehose/trickle Rejuvs are cast.", "Default 90 = anyone not at full health." },
-    SwiftThresh  = { "HP% below which Swiftmend fires on non-tank units", "that already have a HoT ticking." },
     TrickleThresh= { "HP% below which trickle top-up Rejuvs are cast.", "Only runs when nobody is in active danger." },
     TrickleMana  = { "Min mana% required for trickle pass to run.", "Below this, trickle is skipped entirely." },
     TrickleRank  = { "Max Rejuv rank used during trickle pass.", "Tanks bypass this cap and use full rank selection." },
     CritThresh   = { "HP% below which active healing mode activates.", "Above this, only trickle/firehose runs." },
     MoTWMana     = { "Min mana% required to cast Mark of the Wild." },
+    QHAvoid      = { "Skip Regrowth on the lowest-HP target so QuickHeal heals them.", "Rejuv casts on that target are unaffected. Waived if only one candidate." },
+    SwiftExpiry  = { "Seconds remaining on Rejuv that triggers expiry-path Swiftmend.", "Fires on any keypress regardless of HP%. Set 0 to disable." },
 }
 
 local function MCMakeSlider(parent, sliderKey, name, yOffset, minVal, maxVal, step, fmt, getSetting, setSetting)
@@ -1602,22 +1798,193 @@ local function MCMakeFrame(globalName, width, height)
     return f
 end
 
--- /mcdr: per-fight healing style tuning
-local function BuildMCDRFrame()
-    local f = MCMakeFrame("MooncallerDRFrame", 220, 110)
+-------------------------------------------------------------------------------
+-- Tank List Management
+-------------------------------------------------------------------------------
 
-    MCMakeSlider(f, "RgFloor", "Regrowth Floor", -10, 0, 1, 0.05, "%.2f",
-        function() return settings.REGROWTH_NON_TANK_FLOOR or 0.55 end,
-        function(v)
-            settings.REGROWTH_NON_TANK_FLOOR    = v
-            MooncallerDB.REGROWTH_NON_TANK_FLOOR = v
+-- Forward declaration: RefreshTankListPanel is assigned further below once the
+-- GUI scroll child exists. TankListAdd/Remove/Clear call it safely because they
+-- only execute at runtime (keypress/click), not at definition time.
+local RefreshTankListPanel
+
+local function TankListAdd(name)
+    if not name or name == "" then return false end
+    if tankList[name] then
+        Print(name .. " is already in the tank list.")
+        return false
+    end
+    tankList[name] = true
+    if not MooncallerDB.TANK_LIST then MooncallerDB.TANK_LIST = {} end
+    MooncallerDB.TANK_LIST[name] = true
+    Print("Tank added: " .. name)
+    RefreshTankListPanel()
+    return true
+end
+
+local function TankListRemove(name)
+    if not name or name == "" then return false end
+    if not tankList[name] then
+        Print(name .. " is not in the tank list.")
+        return false
+    end
+    tankList[name] = nil
+    if MooncallerDB.TANK_LIST then MooncallerDB.TANK_LIST[name] = nil end
+    Print("Tank removed: " .. name)
+    RefreshTankListPanel()
+    return true
+end
+
+local function TankListClear()
+    for k in pairs(tankList) do tankList[k] = nil end
+    MooncallerDB.TANK_LIST = {}
+    Print("Tank list cleared.")
+    RefreshTankListPanel()
+end
+
+-------------------------------------------------------------------------------
+-- GUI Windows
+-- /mcdr       — Spell rank enable/disable
+-- /mcsettings — All thresholds + behaviour toggles
+-- /mctanks    — Priority tank list management
+-------------------------------------------------------------------------------
+
+local mcDrFrame       = nil
+local mcSettingsFrame = nil
+local mcTanksFrame    = nil
+
+-- Shared helper: make a labelled checkbox
+local function MCMakeCheckbox(parent, globalName, yOff, label, tooltip1, tooltip2,
+                               getVal, setVal)
+    local cb = CreateFrame("CheckButton", globalName, parent, "UICheckButtonTemplate")
+    cb:SetPoint("TOPLEFT", parent, "TOPLEFT", 10, yOff)
+    cb:SetWidth(20)
+    cb:SetHeight(20)
+    cb:SetChecked(getVal() and 1 or 0)
+    local lbl = parent:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    lbl:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+    lbl:SetTextColor(1.0, 0.82, 0.0)
+    lbl:SetText(label)
+    if tooltip1 then
+        cb:SetScript("OnEnter", function()
+            GameTooltip:SetOwner(cb, "ANCHOR_RIGHT")
+            GameTooltip:ClearLines()
+            GameTooltip:AddLine(tooltip1, 1, 1, 1)
+            if tooltip2 then GameTooltip:AddLine(tooltip2, 0.8, 0.8, 0.8) end
+            GameTooltip:Show()
         end)
+        cb:SetScript("OnLeave", function() GameTooltip:Hide() end)
+    end
+    cb:SetScript("OnClick", function()
+        setVal(cb:GetChecked() == 1)
+    end)
+    return cb
+end
 
-    MCMakeSlider(f, "AoeBlanket", "AoE Blanket", -56, 1, 15, 1, "%d",
-        function() return settings.AOE_BLANKET_THRESHOLD or 3 end,
+-- ---- /mcdr: Spell rank enable/disable ----
+
+local function BuildMCDRFrame()
+    local rejuvMax   = table.getn(SPELL_ID_LOOKUP["Rejuvenation"])
+    local regrowthMax = table.getn(SPELL_ID_LOOKUP["Regrowth"])
+    -- Height: title(20) + rejuv section label(16) + rejuvMax rows(18ea) +
+    --         sep(8) + regrowth section label(16) + regrowthMax rows(18ea) +
+    --         sep(8) + swiftmend row(20) + padding(16)
+    local fh = 20 + 16 + rejuvMax*18 + 8 + 16 + regrowthMax*18 + 8 + 20 + 16
+    local f = MCMakeFrame("MooncallerDRFrame", 200, fh)
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -8)
+    title:SetText("Mooncaller — Spell Ranks")
+    title:SetTextColor(0.4, 0.8, 1.0)
+
+    local y = -24
+
+    -- Rejuvenation ranks
+    local rjHdr = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    rjHdr:SetPoint("TOPLEFT", f, "TOPLEFT", 10, y)
+    rjHdr:SetTextColor(0.6, 1.0, 0.6)
+    rjHdr:SetText("Rejuvenation")
+    y = y - 16
+    for rank = 1, rejuvMax do
+        local r = rank  -- capture
+        MCMakeCheckbox(f, "MooncallerRejuvR"..r, y,
+            "Rank " .. r,
+            "Enable/disable Rejuvenation Rank " .. r,
+            nil,
+            function() return not disabledRejuvRanks[r] end,
+            function(v)
+                if v then
+                    disabledRejuvRanks[r] = nil
+                    if MooncallerDB.DISABLED_REJUV_RANKS then
+                        MooncallerDB.DISABLED_REJUV_RANKS[r] = nil
+                    end
+                else
+                    disabledRejuvRanks[r] = true
+                    if not MooncallerDB.DISABLED_REJUV_RANKS then
+                        MooncallerDB.DISABLED_REJUV_RANKS = {}
+                    end
+                    MooncallerDB.DISABLED_REJUV_RANKS[r] = true
+                end
+            end)
+        y = y - 18
+    end
+
+    -- Separator
+    y = y - 4
+    local sep1 = f:CreateTexture(nil, "BACKGROUND")
+    sep1:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, y)
+    sep1:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, y)
+    sep1:SetHeight(1)
+    sep1:SetTexture(0.4, 0.4, 0.4, 0.8)
+    y = y - 8
+
+    -- Regrowth ranks
+    local rgHdr = f:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+    rgHdr:SetPoint("TOPLEFT", f, "TOPLEFT", 10, y)
+    rgHdr:SetTextColor(0.6, 1.0, 0.6)
+    rgHdr:SetText("Regrowth")
+    y = y - 16
+    for rank = 1, regrowthMax do
+        local r = rank
+        MCMakeCheckbox(f, "MooncallerRgR"..r, y,
+            "Rank " .. r,
+            "Enable/disable Regrowth Rank " .. r,
+            nil,
+            function() return not disabledRegrowthRanks[r] end,
+            function(v)
+                if v then
+                    disabledRegrowthRanks[r] = nil
+                    if MooncallerDB.DISABLED_REGROWTH_RANKS then
+                        MooncallerDB.DISABLED_REGROWTH_RANKS[r] = nil
+                    end
+                else
+                    disabledRegrowthRanks[r] = true
+                    if not MooncallerDB.DISABLED_REGROWTH_RANKS then
+                        MooncallerDB.DISABLED_REGROWTH_RANKS = {}
+                    end
+                    MooncallerDB.DISABLED_REGROWTH_RANKS[r] = true
+                end
+            end)
+        y = y - 18
+    end
+
+    -- Separator
+    y = y - 4
+    local sep2 = f:CreateTexture(nil, "BACKGROUND")
+    sep2:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, y)
+    sep2:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, y)
+    sep2:SetHeight(1)
+    sep2:SetTexture(0.4, 0.4, 0.4, 0.8)
+    y = y - 8
+
+    -- Swiftmend master toggle
+    MCMakeCheckbox(f, "MooncallerSwiftmendCB", y,
+        "Swiftmend",
+        "Enable or disable all Swiftmend casts.",
+        nil,
+        function() return settings.SWIFTMEND_ENABLED ~= false end,
         function(v)
-            settings.AOE_BLANKET_THRESHOLD    = v
-            MooncallerDB.AOE_BLANKET_THRESHOLD = v
+            settings.SWIFTMEND_ENABLED    = v
+            MooncallerDB.SWIFTMEND_ENABLED = v
         end)
 
     f:Hide()
@@ -1625,66 +1992,173 @@ local function BuildMCDRFrame()
     return f
 end
 
--- /mcsettings: set-once threshold configuration
+-- ---- /mcsettings: thresholds + behaviour toggles ----
+
 local function BuildMCSettingsFrame()
-    local f = MCMakeFrame("MooncallerSettingsFrame", 230, 356)
+    local f = MCMakeFrame("MooncallerSettingsFrame", 240, 510)
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOP", f, "TOP", 0, -10)
-    title:SetText("Mooncaller — Thresholds")
+    title:SetText("Mooncaller — Settings")
     title:SetTextColor(0.4, 0.8, 1.0)
 
+    -- Thresholds
     MCMakeSlider(f, "RejuvThresh", "Rejuv threshold", -30, 0, 100, 1, "%d%%",
         function() return settings.REJUV_THRESHOLD or 90 end,
-        function(v)
-            settings.REJUV_THRESHOLD    = v
-            MooncallerDB.REJUV_THRESHOLD = v
-        end)
+        function(v) settings.REJUV_THRESHOLD = v; MooncallerDB.REJUV_THRESHOLD = v end)
 
-    MCMakeSlider(f, "SwiftThresh", "Swiftmend threshold", -76, 0, 100, 1, "%d%%",
-        function() return settings.SWIFTMEND_THRESHOLD or 60 end,
-        function(v)
-            settings.SWIFTMEND_THRESHOLD    = v
-            MooncallerDB.SWIFTMEND_THRESHOLD = v
-        end)
-
-    MCMakeSlider(f, "TrickleThresh", "Trickle threshold", -122, 0, 100, 1, "%d%%",
+    MCMakeSlider(f, "TrickleThresh", "Trickle threshold", -76, 0, 100, 1, "%d%%",
         function() return settings.TRICKLE_THRESHOLD or 98 end,
-        function(v)
-            settings.TRICKLE_THRESHOLD    = v
-            MooncallerDB.TRICKLE_THRESHOLD = v
-        end)
+        function(v) settings.TRICKLE_THRESHOLD = v; MooncallerDB.TRICKLE_THRESHOLD = v end)
 
-    MCMakeSlider(f, "TrickleMana", "Trickle mana floor", -168, 0, 100, 5, "%d%%",
+    MCMakeSlider(f, "TrickleMana", "Trickle mana floor", -122, 0, 100, 5, "%d%%",
         function() return settings.TRICKLE_MANA_FLOOR or 40 end,
-        function(v)
-            settings.TRICKLE_MANA_FLOOR    = v
-            MooncallerDB.TRICKLE_MANA_FLOOR = v
-        end)
+        function(v) settings.TRICKLE_MANA_FLOOR = v; MooncallerDB.TRICKLE_MANA_FLOOR = v end)
 
-    MCMakeSlider(f, "TrickleRank", "Trickle max rank", -214, 1, 12, 1, "%d",
+    MCMakeSlider(f, "TrickleRank", "Trickle max rank", -168, 1, 12, 1, "%d",
         function() return settings.TRICKLE_MAX_RANK or 3 end,
-        function(v)
-            settings.TRICKLE_MAX_RANK    = v
-            MooncallerDB.TRICKLE_MAX_RANK = v
-        end)
+        function(v) settings.TRICKLE_MAX_RANK = v; MooncallerDB.TRICKLE_MAX_RANK = v end)
 
-    MCMakeSlider(f, "CritThresh", "Active heal threshold", -260, 0, 100, 1, "%d%%",
+    MCMakeSlider(f, "CritThresh", "Active heal threshold", -214, 0, 100, 1, "%d%%",
         function() return settings.CRITICAL_THRESHOLD or 70 end,
-        function(v)
-            settings.CRITICAL_THRESHOLD    = v
-            MooncallerDB.CRITICAL_THRESHOLD = v
-        end)
+        function(v) settings.CRITICAL_THRESHOLD = v; MooncallerDB.CRITICAL_THRESHOLD = v end)
 
-    MCMakeSlider(f, "MoTWMana", "MoTW mana floor", -306, 0, 100, 5, "%d%%",
+    MCMakeSlider(f, "MoTWMana", "MoTW mana floor", -260, 0, 100, 5, "%d%%",
         function() return settings.MOTW_MANA_THRESHOLD or 50 end,
-        function(v)
-            settings.MOTW_MANA_THRESHOLD    = v
-            MooncallerDB.MOTW_MANA_THRESHOLD = v
-        end)
+        function(v) settings.MOTW_MANA_THRESHOLD = v; MooncallerDB.MOTW_MANA_THRESHOLD = v end)
+
+    MCMakeSlider(f, "RgFloor", "Regrowth floor", -306, 0, 1, 0.05, "%.2f",
+        function() return settings.REGROWTH_NON_TANK_FLOOR or 0.55 end,
+        function(v) settings.REGROWTH_NON_TANK_FLOOR = v; MooncallerDB.REGROWTH_NON_TANK_FLOOR = v end)
+
+    MCMakeSlider(f, "AoeBlanket", "AoE blanket threshold", -352, 1, 15, 1, "%d",
+        function() return settings.AOE_BLANKET_THRESHOLD or 3 end,
+        function(v) settings.AOE_BLANKET_THRESHOLD = v; MooncallerDB.AOE_BLANKET_THRESHOLD = v end)
+
+    MCMakeSlider(f, "SwiftExpiry", "Swiftmend expiry window", -398, 0, 10, 0.5, "%.1fs",
+        function() return settings.SWIFTMEND_EXPIRY_WINDOW or 3.5 end,
+        function(v) settings.SWIFTMEND_EXPIRY_WINDOW = v; MooncallerDB.SWIFTMEND_EXPIRY_WINDOW = v end)
+
+    -- Checkboxes
+    local cbY = -448
+    local function nextCb() local y = cbY; cbY = cbY - 22; return y end
+
+    MCMakeCheckbox(f, "MooncallerSettingsQH", nextCb(),
+        "QuickHeal Avoidance",
+        "Skip Regrowth on the lowest-HP target so QuickHeal heals them.",
+        "Rejuv on that target is unaffected. Waived if only one candidate.",
+        function() return settings.QUICKHEAL_AVOID end,
+        function(v) settings.QUICKHEAL_AVOID = v; MooncallerDB.QUICKHEAL_AVOID = v end)
+
+    MCMakeCheckbox(f, "MooncallerSettingsOH", nextCb(),
+        "Overheal Tanks",
+        "Always keep max Rejuv+Regrowth on listed tanks with live aggro.",
+        "Fires before all other heal logic. Rejuv first, Regrowth next keypress.",
+        function() return settings.OVERHEAL_TANKS end,
+        function(v) settings.OVERHEAL_TANKS = v; MooncallerDB.OVERHEAL_TANKS = v end)
 
     f:Hide()
     mcSettingsFrame = f
+    return f
+end
+
+-- ---- /mctanks: priority tank list ----
+
+local tankListScrollChild = nil
+local tankListRows        = {}
+
+RefreshTankListPanel = function()
+    if not tankListScrollChild then return end
+    for _, row in ipairs(tankListRows) do
+        row.btn:Hide()
+        row.lbl:Hide()
+    end
+    local names = {}
+    for name in pairs(tankList) do table.insert(names, name) end
+    table.sort(names)
+    local rowH = 18
+    for i, name in ipairs(names) do
+        local row = tankListRows[i]
+        if not row then
+            local btn = CreateFrame("Button", nil, tankListScrollChild)
+            btn:SetWidth(14)
+            btn:SetHeight(14)
+            btn:SetNormalTexture("Interface\\Buttons\\UI-StopButton")
+            btn:SetHighlightTexture("Interface\\Buttons\\UI-StopButton")
+            local lbl = tankListScrollChild:CreateFontString(nil, "OVERLAY", "GameFontNormalSmall")
+            lbl:SetTextColor(1, 1, 1)
+            row = { btn = btn, lbl = lbl }
+            tankListRows[i] = row
+        end
+        local yOff = -(i - 1) * rowH - 2
+        row.btn:ClearAllPoints()
+        row.btn:SetPoint("TOPLEFT", tankListScrollChild, "TOPLEFT", 2, yOff)
+        row.btn:Show()
+        local capturedName = name
+        row.btn:SetScript("OnClick", function() TankListRemove(capturedName) end)
+        row.lbl:ClearAllPoints()
+        row.lbl:SetPoint("LEFT", row.btn, "RIGHT", 4, 0)
+        row.lbl:SetText(name)
+        row.lbl:Show()
+    end
+    local contentH = math.max(table.getn(names) * rowH + 4, 20)
+    tankListScrollChild:SetHeight(contentH)
+end
+
+local function BuildMCTanksFrame()
+    local f = MCMakeFrame("MooncallerTanksFrame", 220, 280)
+
+    local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+    title:SetPoint("TOP", f, "TOP", 0, -8)
+    title:SetText("Mooncaller — Priority Tanks")
+    title:SetTextColor(0.4, 0.8, 1.0)
+
+    -- Add Target button
+    local addBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    addBtn:SetPoint("TOPLEFT", f, "TOPLEFT", 8, -26)
+    addBtn:SetWidth(90)
+    addBtn:SetHeight(20)
+    addBtn:SetText("Add Target")
+    addBtn:SetScript("OnClick", function()
+        if UnitExists("target") and UnitIsPlayer("target") then
+            TankListAdd(UnitName("target"))
+        else
+            Print("No valid player target selected.")
+        end
+    end)
+
+    -- Clear All button
+    local clearBtn = CreateFrame("Button", nil, f, "UIPanelButtonTemplate")
+    clearBtn:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -26)
+    clearBtn:SetWidth(90)
+    clearBtn:SetHeight(20)
+    clearBtn:SetText("Clear All")
+    clearBtn:SetScript("OnClick", function()
+        TankListClear()
+    end)
+
+    -- Separator
+    local sep = f:CreateTexture(nil, "BACKGROUND")
+    sep:SetPoint("TOPLEFT",  f, "TOPLEFT",  8, -50)
+    sep:SetPoint("TOPRIGHT", f, "TOPRIGHT", -8, -50)
+    sep:SetHeight(1)
+    sep:SetTexture(0.4, 0.4, 0.4, 0.8)
+
+    -- Scroll list
+    local clipFrame = CreateFrame("ScrollFrame", nil, f)
+    clipFrame:SetPoint("TOPLEFT",     f, "TOPLEFT",     8, -54)
+    clipFrame:SetPoint("BOTTOMRIGHT", f, "BOTTOMRIGHT", -8, 8)
+
+    local scrollChild = CreateFrame("Frame", nil, clipFrame)
+    scrollChild:SetWidth(204)
+    scrollChild:SetHeight(20)
+    clipFrame:SetScrollChild(scrollChild)
+
+    tankListScrollChild = scrollChild
+    RefreshTankListPanel()
+
+    f:Hide()
+    mcTanksFrame = f
     return f
 end
 
@@ -1742,9 +2216,27 @@ eventFrame:SetScript("OnEvent", function()
     if event == "ADDON_LOADED" and arg1 == "Mooncaller" then
         -- Sync settings from SavedVariables
         for k, v in pairs(MooncallerDB) do settings[k] = v end
+        -- Sync tank list
+        if MooncallerDB.TANK_LIST then
+            for name in pairs(MooncallerDB.TANK_LIST) do
+                tankList[name] = true
+            end
+        end
+        -- Sync spell rank disable tables
+        if MooncallerDB.DISABLED_REJUV_RANKS then
+            for rank in pairs(MooncallerDB.DISABLED_REJUV_RANKS) do
+                disabledRejuvRanks[rank] = true
+            end
+        end
+        if MooncallerDB.DISABLED_REGROWTH_RANKS then
+            for rank in pairs(MooncallerDB.DISABLED_REGROWTH_RANKS) do
+                disabledRegrowthRanks[rank] = true
+            end
+        end
         RefreshTalentModifiers()
         BuildMCDRFrame()
         BuildMCSettingsFrame()
+        BuildMCTanksFrame()
         Print("Loaded. Type /mc for help.")
 
     elseif event == "VARIABLES_LOADED" then
@@ -1803,11 +2295,6 @@ end
 SLASH_MCREJUV1 = "/mcrejuv"
 SlashCmdList["MCREJUV"] = function(a)
     SetThreshold("REJUV_THRESHOLD", "Rejuvenation firehose/trickle", a)
-end
-
-SLASH_MCSWIFT1 = "/mcswift"
-SlashCmdList["MCSWIFT"] = function(a)
-    SetThreshold("SWIFTMEND_THRESHOLD", "Swiftmend base", a)
 end
 
 SLASH_MCMANA1 = "/mcmana"
@@ -1902,25 +2389,70 @@ SlashCmdList["MCL"] = function()
     end
 end
 
--- Healing style GUI
+-- Spell rank enable/disable GUI
 SLASH_MCDR1 = "/mcdr"
 SlashCmdList["MCDR"] = function()
     if not mcDrFrame then BuildMCDRFrame() end
-    if mcDrFrame:IsShown() then
-        mcDrFrame:Hide()
-    else
-        mcDrFrame:Show()
-    end
+    if mcDrFrame:IsShown() then mcDrFrame:Hide() else mcDrFrame:Show() end
 end
 
--- Threshold settings GUI
+-- Settings GUI
 SLASH_MCSETTINGS1 = "/mcsettings"
 SlashCmdList["MCSETTINGS"] = function()
     if not mcSettingsFrame then BuildMCSettingsFrame() end
-    if mcSettingsFrame:IsShown() then
-        mcSettingsFrame:Hide()
+    if mcSettingsFrame:IsShown() then mcSettingsFrame:Hide() else mcSettingsFrame:Show() end
+end
+
+-- Tank list GUI
+SLASH_MCTANKS1 = "/mctanks"
+SlashCmdList["MCTANKS"] = function()
+    if not mcTanksFrame then BuildMCTanksFrame() end
+    if mcTanksFrame:IsShown() then mcTanksFrame:Hide() else mcTanksFrame:Show() end
+end
+
+-- QuickHeal avoidance toggle
+SLASH_MCQH1 = "/mcqh"
+SlashCmdList["MCQH"] = function()
+    settings.QUICKHEAL_AVOID     = not settings.QUICKHEAL_AVOID
+    MooncallerDB.QUICKHEAL_AVOID  = settings.QUICKHEAL_AVOID
+    Print("QuickHeal avoidance: " .. (settings.QUICKHEAL_AVOID and "ON" or "OFF"))
+end
+
+-- Tank list management
+SLASH_MCADDTANK1 = "/mcaddtank"
+SlashCmdList["MCADDTANK"] = function(a)
+    local name = (a and a ~= "") and a or (UnitExists("target") and UnitIsPlayer("target") and UnitName("target"))
+    if name then
+        TankListAdd(name)
     else
-        mcSettingsFrame:Show()
+        Print("Usage: /mcaddtank [name]  (or target a player)")
+    end
+end
+
+SLASH_MCREMOVETANK1 = "/mcremovetank"
+SlashCmdList["MCREMOVETANK"] = function(a)
+    local name = (a and a ~= "") and a or (UnitExists("target") and UnitIsPlayer("target") and UnitName("target"))
+    if name then
+        TankListRemove(name)
+    else
+        Print("Usage: /mcremovetank [name]  (or target a player)")
+    end
+end
+
+SLASH_MCCLEARTANKS1 = "/mccleartanks"
+SlashCmdList["MCCLEARTANKS"] = function()
+    TankListClear()
+end
+
+SLASH_MCLISTTANKS1 = "/mclisttanks"
+SlashCmdList["MCLISTTANKS"] = function()
+    local names = {}
+    for name in pairs(tankList) do table.insert(names, name) end
+    if table.getn(names) == 0 then
+        Print("Tank list is empty.")
+    else
+        table.sort(names)
+        Print("Priority tanks: " .. table.concat(names, ", "))
     end
 end
 
