@@ -1224,7 +1224,7 @@ local function HealPartyMembers()
             -- Regrowth gap: missing or below max rank (skipped while moving)
             elseif not isMoving
             and IsUnitInRange(unit, "Regrowth")
-            and GetRegrowthRank(unit) < maxRgRank then
+            and GetRegrowthRank(unit) == 0 then
                 TargetUnit(unit)
                 CastRegrowthSafe(unit, maxRgRank, 1.0)
                 TargetLastTarget()
@@ -2367,11 +2367,11 @@ SlashCmdList["MCL"] = function()
         Print("No valid player target selected.")
         return
     end
-    local targetGUID = UnitGUID("target")
+    local targetName = UnitName("target")
     local found = nil
-    -- Resolve target to a stable unitid via GUID matching
+    -- Resolve target to a stable unitid via name matching (no UnitGUID in 1.12)
     local function checkUnit(uid)
-        if UnitExists(uid) and UnitGUID(uid) == targetGUID then
+        if not found and UnitExists(uid) and UnitName(uid) == targetName then
             found = uid
         end
     end
@@ -2380,10 +2380,10 @@ SlashCmdList["MCL"] = function()
     for i = 1, GetNumRaidMembers()  do checkUnit("raid"..i)  end
     if found then
         settings.FOLLOW_TARGET_UNIT    = found
-        settings.FOLLOW_TARGET_NAME    = UnitName("target")
+        settings.FOLLOW_TARGET_NAME    = targetName
         MooncallerDB.FOLLOW_TARGET_UNIT = found
-        MooncallerDB.FOLLOW_TARGET_NAME = UnitName("target")
-        Print("Follow target set to " .. UnitName("target") .. " (" .. found .. ")")
+        MooncallerDB.FOLLOW_TARGET_NAME = targetName
+        Print("Follow target set to " .. targetName .. " (" .. found .. ")")
     else
         Print("Could not resolve target to a party/raid unitid.")
     end
