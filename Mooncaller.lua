@@ -1213,8 +1213,8 @@ local function HealPartyMembers()
             local name = UnitName(unit)
             if not liveAggro[name] then return end
             if not IsUnitInRange(unit, "Rejuvenation") then return end
-            -- Rejuv gap: missing or below max rank
-            if GetRejuvRank(unit) < maxRejuvRank then
+            -- Rejuv gap: not present
+            if GetRejuvRank(unit) == 0 then
                 TargetUnit(unit)
                 CastRejuvByRank(maxRejuvRank)
                 TargetLastTarget()
