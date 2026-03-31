@@ -58,6 +58,15 @@ local aggroCount      = {}
 -- liveAggro[unitName] = true/false, set directly from Banzai events
 local liveAggro       = {}
 
+-- losBlacklist[unitName] = expiry timestamp — units that recently caused a
+-- "line of sight" or "out of range" spell failure. Skipped in candidate build.
+-- Cleared on combat end.
+local losBlacklist    = {}
+
+-- Name of the last unit we attempted to cast on — used by the UI_ERROR_MESSAGE
+-- handler to know who to blacklist on LoS/range failure.
+local lastHealTarget  = nil
+
 -- tankList[unitName] = true — manually configured priority tanks
 -- Mirrors MooncallerDB.TANK_LIST; populated on ADDON_LOADED.
 local tankList        = {}
@@ -207,6 +216,13 @@ local function Debug(msg)
     if settings.DEBUG_MODE then
         DEFAULT_CHAT_FRAME:AddMessage("|cff88ffffMooncaller:|r " .. msg)
     end
+end
+
+-- Target a unit for casting and record their name so the UI_ERROR_MESSAGE
+-- handler knows who to blacklist on LoS/range failure.
+local function TargetAndRecord(unit)
+    lastHealTarget = UnitName(unit)
+    TargetUnit(unit)
 end
 
 -------------------------------------------------------------------------------
@@ -993,16 +1009,20 @@ end
 -------------------------------------------------------------------------------
 
 local function IterateHealableUnits(callback)
-    callback("player")
+    local now = GetTime()
+    local function check(unit)
+        if not UnitExists(unit) then return end
+        if not UnitIsVisible(unit) then return end
+        local uname = UnitName(unit)
+        if uname and losBlacklist[uname] and losBlacklist[uname] > now then return end
+        callback(unit)
+    end
+    check("player")
     local numRaid = GetNumRaidMembers()
     if numRaid > 0 then
-        for i = 1, numRaid do
-            callback("raid" .. i)
-        end
+        for i = 1, numRaid do check("raid" .. i) end
     else
-        for i = 1, GetNumPartyMembers() do
-            callback("party" .. i)
-        end
+        for i = 1, GetNumPartyMembers() do check("party" .. i) end
     end
 end
 
@@ -1182,7 +1202,7 @@ local function HealPartyMembers()
                       " too high for pre-emptive Rejuv, deferring to heal loop")
             else
                 local unitName = UnitName(unitId) or unitId
-                TargetUnit(unitId)
+                TargetAndRecord(unitId)
                 CastRejuvByRank(maxRejuvRank)
                 TargetLastTarget()
                 LogHealAction(unitId, 1.0, "REACTIVE_REJUV", maxRejuvRank)
@@ -1215,7 +1235,7 @@ local function HealPartyMembers()
             if not IsUnitInRange(unit, "Rejuvenation") then return end
             -- Rejuv gap: not present
             if GetRejuvRank(unit) == 0 then
-                TargetUnit(unit)
+                TargetAndRecord(unit)
                 CastRejuvByRank(maxRejuvRank)
                 TargetLastTarget()
                 LogHealAction(unit, 1.0, "OVERHEAL_REJUV", maxRejuvRank)
@@ -1225,7 +1245,7 @@ local function HealPartyMembers()
             elseif not isMoving
             and IsUnitInRange(unit, "Regrowth")
             and GetRegrowthRank(unit) == 0 then
-                TargetUnit(unit)
+                TargetAndRecord(unit)
                 CastRegrowthSafe(unit, maxRgRank, 1.0)
                 TargetLastTarget()
                 LogHealAction(unit, 1.0, "OVERHEAL_REGROWTH", maxRgRank)
@@ -1270,7 +1290,7 @@ local function HealPartyMembers()
         if bestUnit then
             local name     = UnitName(bestUnit)
             local pressure = ComputeTankPressureScore(bestUnit)
-            TargetUnit(bestUnit)
+            TargetAndRecord(bestUnit)
             CastSpellByName("Swiftmend")
             TargetLastTarget()
             LogHealAction(bestUnit, pressure, "SWIFTMEND_EXPIRY", 1)
@@ -1288,6 +1308,7 @@ local function HealPartyMembers()
         if not UnitExists(unit) then return end
         if UnitIsDeadOrGhost(unit) then return end
         if not UnitIsConnected(unit) then return end
+        if not UnitIsVisible(unit) then return end
         if not IsUnitInRange(unit, "Rejuvenation") then return end
         local hp = (UnitHealth(unit) / UnitHealthMax(unit)) * 100
         table.insert(allMembers, { unit = unit, health = hp })
@@ -1345,7 +1366,7 @@ local function HealPartyMembers()
                                         table.getn(SPELL_ID_LOOKUP["Rejuvenation"]))
                         Debug("TRICKLE: Rejuv R" .. rank .. " on " .. UnitName(target))
                     end
-                    TargetUnit(target)
+                    TargetAndRecord(target)
                     CastRejuvByRank(rank)
                     TargetLastTarget()
                     healBusy = false
@@ -1372,7 +1393,7 @@ local function HealPartyMembers()
             local target = firehoseCandidates[1]
             if IsUnitInRange(target, "Rejuvenation") then
                 local rank = PickRejuvRank(target, false)
-                TargetUnit(target)
+                TargetAndRecord(target)
                 CastRejuvByRank(rank)
                 TargetLastTarget()
                 Debug("FIREHOSE: Rejuv R" .. rank .. " on " .. UnitName(target))
@@ -1399,7 +1420,7 @@ local function HealPartyMembers()
                 table.sort(smCandidates, SortByEffectiveHealth)
                 local target   = smCandidates[1]
                 local pressure = ComputeTankPressureScore(target)
-                TargetUnit(target)
+                TargetAndRecord(target)
                 CastSpellByName("Swiftmend")
                 TargetLastTarget()
                 Debug("SWIFTMEND on " .. UnitName(target) ..
@@ -1477,7 +1498,7 @@ local function HealPartyMembers()
             and not isMoving and IsUnitInRange(topUnit, "Regrowth") then
                 local rgRank = PickRegrowthRank(topPres)
                 if rgRank > 0 then
-                    TargetUnit(topUnit)
+                    TargetAndRecord(topUnit)
                     local cast = CastRegrowthSafe(topUnit, rgRank, topPres)
                     TargetLastTarget()
                     if cast then
@@ -1496,7 +1517,7 @@ local function HealPartyMembers()
             local target   = uncoveredUnits[1].unit
             local pressure = uncoveredUnits[1].pressure
             local rank     = PickRejuvRank(target, DetectClearcasting())
-            TargetUnit(target)
+            TargetAndRecord(target)
             CastRejuvByRank(rank)
             TargetLastTarget()
             Debug(string.format("AOE BLANKET: Rejuv R%d on %s (pressure=%.2f uncovered=%d)",
@@ -1530,6 +1551,24 @@ local function HealPartyMembers()
             Debug(string.format("HEAL: %s hp=%.0f%% pressure=%.2f tank=%s",
                   name, hp, pressure, tostring(isTank)))
 
+            -- Swiftmend: non-tank first, when they have a HoT rolling.
+            -- Evaluated before Regrowth so a spiked unit with a Rejuv gets an
+            -- instant burst heal rather than waiting for a Regrowth cast time.
+            if not isTank
+            and (settings.SWIFTMEND_ENABLED ~= false)
+            and HasAnyHotForSwiftmend(unit)
+            and not IsSwiftmendOnCooldown()
+            and IsUnitInRange(unit, "Swiftmend") then
+                TargetAndRecord(unit)
+                CastSpellByName("Swiftmend")
+                TargetLastTarget()
+                Debug("SWIFTMEND on " .. name ..
+                      string.format(" (pressure=%.2f)", pressure))
+                LogHealAction(unit, pressure, "SWIFTMEND", 1)
+                healingDone = true
+                break
+            end
+
             -- Regrowth: tanks always; non-tanks only above REGROWTH_NON_TANK_FLOOR
             -- QuickHeal avoidance: skip Regrowth on lowest-pressure unit so their
             -- direct heal lands there. Rejuv still fires on them normally.
@@ -1544,7 +1583,7 @@ local function HealPartyMembers()
             and IsUnitInRange(unit, "Regrowth") then
                 local rgRank = PickRegrowthRank(pressure)
                 if rgRank > 0 then
-                    TargetUnit(unit)
+                    TargetAndRecord(unit)
                     local cast = CastRegrowthSafe(unit, rgRank, pressure)
                     TargetLastTarget()
                     if cast then
@@ -1560,7 +1599,7 @@ local function HealPartyMembers()
             -- Rejuv: fresh cast or upgrade
             if currentRejuvRank == 0 then
                 local rank = PickRejuvRank(unit, DetectClearcasting())
-                TargetUnit(unit)
+                TargetAndRecord(unit)
                 CastRejuvByRank(rank)
                 TargetLastTarget()
                 Debug("REJUV R" .. rank .. " on " .. name)
@@ -1570,7 +1609,7 @@ local function HealPartyMembers()
             else
                 local upgradeRank = ShouldUpgradeRejuv(unit, currentRejuvRank)
                 if upgradeRank > 0 then
-                    TargetUnit(unit)
+                    TargetAndRecord(unit)
                     CastRejuvByRank(upgradeRank)
                     TargetLastTarget()
                     Debug("REJUV UPGRADE R" .. currentRejuvRank ..
@@ -1620,7 +1659,7 @@ local function BuffPartyMembers()
         if not UnitIsConnected(unit) then return end
         if not IsUnitInRange(unit, "Mark of the Wild") then return end
         if not HasAnyDruidBuff(unit) then
-            TargetUnit(unit)
+            TargetAndRecord(unit)
             CastSpellByName("Mark of the Wild")
             TargetLastTarget()
             Debug("MOTW on " .. UnitName(unit))
@@ -1889,11 +1928,11 @@ local function BuildMCDRFrame()
     --         sep(8) + regrowth section label(16) + regrowthMax rows(18ea) +
     --         sep(8) + swiftmend row(20) + padding(16)
     local fh = 20 + 16 + rejuvMax*18 + 8 + 16 + regrowthMax*18 + 8 + 20 + 16
-    local f = MCMakeFrame("MooncallerDRFrame", 200, fh)
+    local f = MCMakeFrame("MooncallerDRFrame", 120, fh)
 
     local title = f:CreateFontString(nil, "OVERLAY", "GameFontNormal")
     title:SetPoint("TOP", f, "TOP", 0, -8)
-    title:SetText("Mooncaller — Spell Ranks")
+    title:SetText("Ranks")
     title:SetTextColor(0.4, 0.8, 1.0)
 
     local y = -24
@@ -2035,7 +2074,7 @@ local function BuildMCSettingsFrame()
         function() return settings.AOE_BLANKET_THRESHOLD or 3 end,
         function(v) settings.AOE_BLANKET_THRESHOLD = v; MooncallerDB.AOE_BLANKET_THRESHOLD = v end)
 
-    MCMakeSlider(f, "SwiftExpiry", "Swiftmend expiry window", -398, 0, 10, 0.5, "%.1fs",
+    MCMakeSlider(f, "SwiftExpiry", "Swiftmend expiry window", -398, 0, 12, 0.5, "%.1fs",
         function() return settings.SWIFTMEND_EXPIRY_WINDOW or 3.5 end,
         function(v) settings.SWIFTMEND_EXPIRY_WINDOW = v; MooncallerDB.SWIFTMEND_EXPIRY_WINDOW = v end)
 
@@ -2189,6 +2228,7 @@ eventFrame:RegisterEvent("PLAYER_REGEN_ENABLED")   -- combat end
 eventFrame:RegisterEvent("SPELLCAST_STOP")
 eventFrame:RegisterEvent("SPELLCAST_FAILED")
 eventFrame:RegisterEvent("LEARNED_SPELL_IN_TAB")   -- talent point spent
+eventFrame:RegisterEvent("UI_ERROR_MESSAGE")        -- catches LoS and out-of-range failures
 
 local function InitBanzai()
     if MooncallerEvents then return end  -- already initialised
@@ -2259,6 +2299,7 @@ eventFrame:SetScript("OnEvent", function()
         for k in pairs(liveAggro)  do liveAggro[k]  = nil end
         for k in pairs(aggroCount) do aggroCount[k] = nil end
         for k in pairs(pendingReactiveRejuv) do pendingReactiveRejuv[k] = nil end
+        for k in pairs(losBlacklist) do losBlacklist[k] = nil end
         healBusy = false
         ManageTreeForm()
         -- Auto-flush log at end of combat if logging is active and buffer has entries
@@ -2266,8 +2307,30 @@ eventFrame:SetScript("OnEvent", function()
             FlushLog()
         end
 
-    elseif event == "SPELLCAST_STOP" or event == "SPELLCAST_FAILED" then
+    elseif event == "SPELLCAST_STOP" then
         healBusy = false
+
+    elseif event == "SPELLCAST_FAILED" then
+        healBusy = false
+
+    elseif event == "UI_ERROR_MESSAGE" then
+        -- arg1 is a Blizzard global error string constant
+        if lastHealTarget and arg1 then
+            local expiry = nil
+            if arg1 == ERR_SPELL_OUT_OF_RANGE then
+                expiry = GetTime() + 5.0
+                Debug("LoS/range blacklist (out of range): " .. lastHealTarget .. " for 5s")
+            elseif arg1 == SPELL_FAILED_LINE_OF_SIGHT then
+                expiry = GetTime() + 2.0
+                Debug("LoS/range blacklist (line of sight): " .. lastHealTarget .. " for 2s")
+            end
+            if expiry then
+                losBlacklist[lastHealTarget] = expiry
+                lastHealTarget = nil
+                healBusy = false
+                HealPartyMembers()
+            end
+        end
     end
 end)
 
