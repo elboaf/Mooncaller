@@ -1,6 +1,6 @@
 # Mooncaller
 
-**Version:** 0.2  
+**Version:** 1.0
 **Author:** Rel  
 **Client:** Turtle WoW 1.12 / SuperWoW
 
