@@ -67,6 +67,18 @@ local losBlacklist    = {}
 -- handler to know who to blacklist on LoS/range failure.
 local lastHealTarget  = nil
 
+-- Cast timestamps for buff-capped units where UnitBuff won't show our HoTs.
+-- lastRejuvCast[unitName]    = GetTime() of last successful Rejuv cast (12s duration)
+-- lastRegrowthCast[unitName] = GetTime() of last successful Regrowth cast (21s duration)
+local REJUV_DURATION    = 12
+local REGROWTH_DURATION = 21
+local lastRejuvCast    = {}
+local lastRegrowthCast = {}
+
+-- The name of the last spell we attempted to cast — set alongside lastHealTarget
+-- so SPELLCAST_STOP knows which timestamp table to update.
+local lastSpellCast   = nil
+
 -- tankList[unitName] = true — manually configured priority tanks
 -- Mirrors MooncallerDB.TANK_LIST; populated on ADDON_LOADED.
 local tankList        = {}
@@ -289,6 +301,7 @@ end
 
 -- Returns the rank number (1-based) of the Rejuvenation currently on the unit,
 -- or 0 if no Rejuvenation buff is present.
+-- Falls back to cast timestamp for buff-capped units where UnitBuff can't see it.
 local function GetRejuvRank(unit)
     local ids = SPELL_ID_LOOKUP["Rejuvenation"]
     for i = 1, 32 do
@@ -298,11 +311,17 @@ local function GetRejuvRank(unit)
             if buffId == id then return rank end
         end
     end
+    -- Buff not visible — check cast timestamp fallback
+    local name = UnitName(unit)
+    if name and lastRejuvCast[name] and (GetTime() - lastRejuvCast[name]) < REJUV_DURATION then
+        return table.getn(SPELL_ID_LOOKUP["Rejuvenation"])  -- assume max rank
+    end
     return 0
 end
 
 -- Returns the rank number (1-based) of the Regrowth HoT currently on the unit,
 -- or 0 if no Regrowth buff is present.
+-- Falls back to cast timestamp for buff-capped units where UnitBuff can't see it.
 local function GetRegrowthRank(unit)
     local ids = SPELL_ID_LOOKUP["Regrowth"]
     for i = 1, 32 do
@@ -311,6 +330,11 @@ local function GetRegrowthRank(unit)
         for rank, id in ipairs(ids) do
             if buffId == id then return rank end
         end
+    end
+    -- Buff not visible — check cast timestamp fallback
+    local name = UnitName(unit)
+    if name and lastRegrowthCast[name] and (GetTime() - lastRegrowthCast[name]) < REGROWTH_DURATION then
+        return table.getn(SPELL_ID_LOOKUP["Regrowth"])  -- assume max rank
     end
     return 0
 end
@@ -686,6 +710,7 @@ local function CastRejuvByRank(rank)
         return
     end
     local rankStr = rank == maxRank and "Rejuvenation" or ("Rejuvenation(Rank " .. rank .. ")")
+    lastSpellCast = "Rejuvenation"
     CastSpellByName(rankStr)
     Debug("Casting " .. rankStr)
 end
@@ -799,6 +824,7 @@ local function CastRegrowthSafe(unit, intendedRank, pressure)
     local rankStr = castRank == maxRgRank
         and "Regrowth"
         or  ("Regrowth(Rank " .. castRank .. ")")
+    lastSpellCast = "Regrowth"
     CastSpellByName(rankStr)
     Debug("Casting " .. rankStr .. " on " .. UnitName(unit))
     return true
@@ -1531,11 +1557,18 @@ local function HealPartyMembers()
     -- ---- Step 2: Single-target active healing ----
     -- QuickHeal avoidance: when ON, skip Regrowth on the lowest-pressure candidate
     -- so QuickHeal's direct heal lands there. Rejuv is unaffected.
-    -- Waived when there is only one candidate.
+    -- Waived when only one candidate exists, or when the avoided unit has no Rejuv
+    -- (in that case we need to lay Rejuv on them so Swiftmend can fire later).
     local qhAvoidUnit = nil
     if settings.QUICKHEAL_AVOID and table.getn(pressureCandidates) > 1 then
-        qhAvoidUnit = pressureCandidates[table.getn(pressureCandidates)].unit
-        Debug("QuickHeal avoid: deferring Regrowth on " .. (UnitName(qhAvoidUnit) or "?"))
+        local avoidEntry = pressureCandidates[table.getn(pressureCandidates)]
+        -- Only avoid if they already have a Rejuv — otherwise we'd be blocking
+        -- all healing on them, since skipForRejuv won't apply (pressure may be
+        -- high enough) and Rejuv is the only remaining option.
+        if GetRejuvRank(avoidEntry.unit) > 0 then
+            qhAvoidUnit = avoidEntry.unit
+            Debug("QuickHeal avoid: deferring Regrowth on " .. (UnitName(qhAvoidUnit) or "?"))
+        end
     end
 
     for _, entry in ipairs(pressureCandidates) do
@@ -2308,9 +2341,22 @@ eventFrame:SetScript("OnEvent", function()
         end
 
     elseif event == "SPELLCAST_STOP" then
+        -- Record successful cast timestamp for buff-cap fallback
+        if lastHealTarget and lastSpellCast then
+            local now = GetTime()
+            if lastSpellCast == "Rejuvenation" then
+                lastRejuvCast[lastHealTarget] = now
+                Debug("Cast timestamp: Rejuv on " .. lastHealTarget)
+            elseif lastSpellCast == "Regrowth" then
+                lastRegrowthCast[lastHealTarget] = now
+                Debug("Cast timestamp: Regrowth on " .. lastHealTarget)
+            end
+        end
+        lastSpellCast = nil
         healBusy = false
 
     elseif event == "SPELLCAST_FAILED" then
+        lastSpellCast = nil
         healBusy = false
 
     elseif event == "UI_ERROR_MESSAGE" then
@@ -2327,8 +2373,6 @@ eventFrame:SetScript("OnEvent", function()
             if expiry then
                 losBlacklist[lastHealTarget] = expiry
                 lastHealTarget = nil
-                healBusy = false
-                HealPartyMembers()
             end
         end
     end
